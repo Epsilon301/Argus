@@ -7,6 +7,9 @@ __pycache__/
 .env
 .env.local
 .env*.local
+.env.plugins
+.env.plugin
+*.bak
 
 # Next.js
 argus-app/.next/
@@ -14,5 +17,16 @@ argus-app/node_modules/
 argus-app/.turbo/
 argus-api/node_modules/
 
+# Secrets
+certbot/
+cloudflared/credentials.json
+certbot/duckdns.ini
+
 # macOS
 .DS_Store
+logs/
+.brv/
+node_modules/
+.vercel
+phantom/target/
+.worktrees/

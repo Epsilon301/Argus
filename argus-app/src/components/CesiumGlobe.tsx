@@ -3,63 +3,109 @@
 import "cesium/Build/Cesium/Widgets/widgets.css";
 
 import {
+  ArcType,
   Cartographic,
   Cartesian2,
   Cartesian3,
   Color,
+  ColorMaterialProperty,
+  ConstantProperty,
   createOsmBuildingsAsync,
   createWorldTerrainAsync,
   Entity,
   HeadingPitchRoll,
+  HorizontalOrigin,
   Ion,
   JulianDate,
+  LabelStyle,
   Math as CesiumMath,
+  NearFarScalar,
   PolylineGlowMaterialProperty,
+  Rectangle,
+  SceneMode as CesiumSceneMode,
   ScreenSpaceEventHandler,
   ScreenSpaceEventType,
+  UrlTemplateImageryProvider,
+  VerticalOrigin,
   Viewer,
   defined,
 } from "cesium";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ARGUS_CONFIG, CAMERA_PRESETS } from "@/lib/config";
-import { CctvLayer } from "@/lib/cesium/layers/cctvLayer";
 import { FlightLayer } from "@/lib/cesium/layers/flightLayer";
 import { MilitaryLayer } from "@/lib/cesium/layers/militaryLayer";
 import { RasterLayer } from "@/lib/cesium/layers/rasterLayer";
+import { BasesLayer } from "@/lib/cesium/layers/basesLayer";
+import { OutageLayer } from "@/lib/cesium/layers/outageLayer";
+import { ThreatLayer } from "@/lib/cesium/layers/threatLayer";
+import { AnomalyLayer } from "@/lib/cesium/layers/anomalyLayer";
 import { SatelliteLayer } from "@/lib/cesium/layers/satelliteLayer";
 import { SeismicLayer } from "@/lib/cesium/layers/seismicLayer";
+import { GdeltLayer } from "@/lib/cesium/layers/gdeltLayer";
+import { WeatherLayer } from "@/lib/cesium/layers/weatherLayer";
+import { VesselLayer } from "@/lib/cesium/layers/vesselLayer";
 import { VisualModeController } from "@/lib/cesium/shaders/visualModes";
 import { fetchMilitaryFlights } from "@/lib/ingest/adsb";
-import { fetchCctvCameras } from "@/lib/ingest/cctv";
 import { fetchOpenSkyFlights } from "@/lib/ingest/opensky";
 import { fetchAircraftPhoto } from "@/lib/ingest/planespotters";
 import { PollingManager } from "@/lib/ingest/pollingManager";
-import { fetchTleRecords, computeSatellitePositions } from "@/lib/ingest/tle";
-import { PlaybackEngine } from "@/lib/playback/playbackEngine";
-import { RecordingBuffer } from "@/lib/playback/recordingBuffer";
+import { computeSatellitePositions, fetchTleRecords } from "@/lib/ingest/tle";
+import { fetchInternetOutages } from "@/lib/ingest/cloudflareRadar";
+import { fetchThreatPulses } from "@/lib/ingest/otx";
+import { fetchFredObservations } from "@/lib/ingest/fred";
+import { fetchAisVessels } from "@/lib/ingest/aisstream";
 import { fetchUsgsQuakes } from "@/lib/ingest/usgs";
+import { fetchGdeltEvents } from "@/lib/ingest/gdelt";
+import { ANOMALY_SITES, CATEGORY_COLORS, CATEGORY_LABELS, STATUS_ICONS } from "@/data/anomalyAtlas";
+import { createAnomalyMarkerSvg } from "@/lib/cesium/tacticalMarker";
+import { fetchIssIntel } from "@/lib/ingest/iss";
+import { recordFlights, recordMilitary, recordSatellites, recordQuakes, recordOutages, recordThreats } from "@/lib/ingest/recorder";
 import {
   analyzeFlights,
   analyzeMilitary,
   analyzeSatellites,
   analyzeSeismic,
+  analyzePhantomResults,
   generateBriefing,
 } from "@/lib/intel/analysisEngine";
-import type { IntelAlert } from "@/lib/intel/analysisEngine";
+import type { IntelAlert, PhantomAnomaly } from "@/lib/intel/analysisEngine";
 import { useArgusStore } from "@/store/useArgusStore";
 import type { SearchResult } from "@/store/useArgusStore";
-import type { IntelDatum, IntelImportance, PlatformMode, SelectedIntel, SatelliteRecord } from "@/types/intel";
+import type {
+  IntelDatum,
+  IntelImportance,
+  PlatformMode,
+  SceneMode,
+  SelectedIntel,
+  SatelliteRecord,
+} from "@/types/intel";
 
 import { HudOverlay } from "./HudOverlay";
+import { useEpicFuryStore } from "@/store/useEpicFuryStore";
+import {
+  mapGdeltIncidents,
+  mapMilitaryIncidents,
+  mapVesselIncidents,
+  mapSeismicIncidents,
+} from "@/lib/epicFuryMappers";
+import { FlatMapView } from "./FlatMapView";
 
 type CesiumGlobeProps = {
   className?: string;
 };
 
 type AnalyticsLayer = {
-  variable: string;
-  tile_url: string | null;
+  id: string;
+  label: string;
+  source: string;
+  type: string;
+  tileUrl: string;
+  maximumLevel?: number;
+  available: boolean;
+  // legacy fields from old argus-api format
+  variable?: string;
+  tile_url?: string | null;
   source_file?: string | null;
   error?: string | null;
 };
@@ -67,6 +113,126 @@ type AnalyticsLayer = {
 type AnalyticsResponse = {
   layers: AnalyticsLayer[];
   available_file_count?: number;
+  fallback?: boolean;
+  error?: string;
+};
+
+type TileErrorLike = {
+  message?: unknown;
+  error?: unknown;
+  retry?: boolean;
+};
+
+type ImageryProviderWithErrorEvent = {
+  errorEvent?: {
+    addEventListener?: (listener: (error: TileErrorLike) => void) => (() => void) | void;
+  };
+};
+
+type ImageryLayerWithProvider = {
+  imageryProvider?: ImageryProviderWithErrorEvent;
+};
+
+/** Zoom-box hotspot regions rendered as rectangles on the globe */
+const ZOOM_REGIONS = [
+  { id: "zr-mideast", label: "MIDEAST", west: 30, south: 12, east: 63, north: 42, color: "#fb4934", height: 1_200_000 },
+  { id: "zr-europe", label: "EUROPE", west: -12, south: 35, east: 45, north: 72, color: "#83a598", height: 2_500_000 },
+  { id: "zr-east-asia", label: "E. ASIA", west: 100, south: 18, east: 150, north: 50, color: "#fabd2f", height: 3_000_000 },
+  { id: "zr-south-asia", label: "S. ASIA", west: 60, south: 5, east: 100, north: 40, color: "#d3869b", height: 2_000_000 },
+  { id: "zr-north-am", label: "N. AMERICA", west: -130, south: 24, east: -65, north: 55, color: "#8ec07c", height: 4_000_000 },
+  { id: "zr-south-am", label: "S. AMERICA", west: -82, south: -56, east: -34, north: 14, color: "#fe8019", height: 4_000_000 },
+  { id: "zr-africa", label: "AFRICA", west: -18, south: -36, east: 52, north: 38, color: "#b8bb26", height: 4_500_000 },
+  { id: "zr-arctic", label: "ARCTIC", west: -180, south: 66, east: 180, north: 90, color: "#458588", height: 3_500_000 },
+  { id: "zr-oceania", label: "OCEANIA", west: 110, south: -48, east: 180, north: -8, color: "#689d6a", height: 3_500_000 },
+  { id: "zr-ukraine", label: "UKRAINE", west: 22, south: 44, east: 41, north: 53, color: "#fb4934", height: 800_000 },
+  { id: "zr-taiwan-str", label: "TAIWAN STR.", west: 115, south: 21, east: 125, north: 28, color: "#fb4934", height: 600_000 },
+  { id: "zr-horn-africa", label: "HORN / RED SEA", west: 36, south: 2, east: 55, north: 18, color: "#fe8019", height: 800_000 },
+] as const;
+
+/**
+ * Nuke ALL Cesium error panels unconditionally.
+ *
+ * Previous attempts tried to regex-match "zoom level not supported" but the
+ * actual error text from imagery providers varies wildly (generic titles like
+ * "An error occurred while rendering" with zoom details buried in nested
+ * error objects or stack traces). Argus has its own error handling — Cesium
+ * error panels are never useful here, so suppress them all.
+ */
+const suppressCesiumErrorPanels = (viewer: Viewer): (() => void) => {
+  const cleanupFns: Array<() => void> = [];
+  const seenProviders = new WeakSet<object>();
+  const imageryLayers = viewer.imageryLayers;
+  const widget = viewer.cesiumWidget as unknown as {
+    showErrorPanel?: (...args: unknown[]) => void;
+  };
+
+  const removeAllErrorPanels = () => {
+    const panels = viewer.container.querySelectorAll(".cesium-widget-errorPanel");
+    for (const panel of panels) {
+      panel.remove();
+    }
+  };
+
+  // Swallow tile-provider errors so they never trigger retry loops or panels
+  const attachProvider = (provider?: ImageryProviderWithErrorEvent) => {
+    if (!provider || typeof provider !== "object" || seenProviders.has(provider)) {
+      return;
+    }
+
+    seenProviders.add(provider);
+    const removeListener = provider.errorEvent?.addEventListener?.(
+      (tileError: TileErrorLike) => {
+        tileError.retry = false;
+      },
+    );
+
+    if (typeof removeListener === "function") {
+      cleanupFns.push(removeListener);
+    }
+  };
+
+  const attachLayer = (layer?: ImageryLayerWithProvider) => {
+    attachProvider(layer?.imageryProvider);
+  };
+
+  for (let index = 0; index < imageryLayers.length; index += 1) {
+    attachLayer(imageryLayers.get(index) as ImageryLayerWithProvider);
+  }
+
+  const removeLayerAddedListener = imageryLayers.layerAdded.addEventListener((layer) => {
+    attachLayer(layer as ImageryLayerWithProvider);
+  });
+  if (typeof removeLayerAddedListener === "function") {
+    cleanupFns.push(removeLayerAddedListener);
+  }
+
+  // Replace showErrorPanel with a no-op — all Cesium error panels are suppressed
+  const originalShowErrorPanel = widget.showErrorPanel;
+  if (typeof originalShowErrorPanel === "function") {
+    widget.showErrorPanel = (...args: unknown[]) => {
+      console.debug("[cesium] suppressed error panel:", ...args);
+    };
+
+    cleanupFns.push(() => {
+      widget.showErrorPanel = originalShowErrorPanel;
+    });
+  }
+
+  // Belt-and-suspenders: MutationObserver catches any panels that slip through
+  const observer = new MutationObserver(() => {
+    removeAllErrorPanels();
+  });
+  observer.observe(viewer.container, { childList: true, subtree: true });
+  cleanupFns.push(() => observer.disconnect());
+
+  // Remove any panels that already exist
+  removeAllErrorPanels();
+
+  return () => {
+    for (const cleanup of cleanupFns.reverse()) {
+      cleanup();
+    }
+  };
 };
 
 const formatValue = (value: unknown): string => {
@@ -102,14 +268,32 @@ const toNumber = (value: unknown): number | null =>
 const readPropertyBag = (entity: Entity, at: JulianDate): Record<string, unknown> => {
   const values: Record<string, unknown> = {};
   const bag = entity.properties as
-    | (Record<string, unknown> & { propertyNames?: string[] })
+    | (Record<string, unknown> & { propertyNames?: string[]; getValue?: (time: JulianDate) => Record<string, unknown> })
     | undefined;
 
-  if (!bag || !Array.isArray(bag.propertyNames)) {
+  if (!bag) return values;
+
+  // Try PropertyBag.getValue() first — returns all properties as a plain object
+  if (typeof bag.getValue === "function") {
+    try {
+      const all = bag.getValue(at);
+      if (all && typeof all === "object") return all as Record<string, unknown>;
+    } catch { /* fall through */ }
+  }
+
+  // Standard path: iterate propertyNames
+  if (Array.isArray(bag.propertyNames)) {
+    for (const key of bag.propertyNames) {
+      const candidate = bag[key] as { getValue?: (time: JulianDate) => unknown } | undefined;
+      values[key] =
+        typeof candidate?.getValue === "function" ? candidate.getValue(at) : candidate;
+    }
     return values;
   }
 
-  for (const key of bag.propertyNames) {
+  // Fallback: iterate own keys (handles plain object properties)
+  for (const key of Object.keys(bag)) {
+    if (key === "propertyNames" || key === "definitionChanged" || key === "isConstant") continue;
     const candidate = bag[key] as { getValue?: (time: JulianDate) => unknown } | undefined;
     values[key] =
       typeof candidate?.getValue === "function" ? candidate.getValue(at) : candidate;
@@ -123,9 +307,95 @@ const inferKindFromId = (id: string): string => {
   if (id.startsWith("mil-")) return "military";
   if (id.startsWith("sat-")) return "satellite";
   if (id.startsWith("quake-")) return "earthquake";
-  if (id.startsWith("cctv-")) return "cctv";
+  if (id.startsWith("anomaly-")) return "anomaly";
+
+  if (id.startsWith("base-")) return "base";
+  if (id.startsWith("outage-")) return "outage";
+  if (id.startsWith("threat-")) return "threat";
+  if (id.startsWith("vessel-")) return "vessel";
   return "unknown";
 };
+
+const buildFlightAwareUrl = (callsign: unknown): string | undefined => {
+  if (typeof callsign !== "string") return undefined;
+  const normalized = callsign.replace(/\s+/g, "").toUpperCase();
+  if (!normalized) return undefined;
+  return `https://www.flightaware.com/live/flight/${encodeURIComponent(normalized)}`;
+};
+
+const buildAnalysisSummary = (kind: string, props: Record<string, unknown>, name: string): string => {
+  switch (kind) {
+    case "flight":
+      return [
+        `${name} is a ${String(props.flightCategory ?? "tracked")} civilian aircraft.`,
+        props.originCountry ? `Origin country: ${props.originCountry}.` : null,
+        typeof props.velocity === "number" ? `Current velocity is ${Math.round(props.velocity)} m/s.` : null,
+        typeof props.track === "number" ? `Track is ${Math.round(props.track)} degrees.` : null,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    case "military":
+      return [
+        `${name} is a military aircraft track.`,
+        props.aircraftFullName ? `Platform: ${props.aircraftFullName}.` : null,
+        props.aircraftOrigin ? `Origin: ${props.aircraftOrigin}.` : null,
+        typeof props.velocity === "number" ? `Current velocity is ${Math.round(props.velocity)} m/s.` : null,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    case "gdelt":
+      return [
+        `${name} is a GDELT event with ${props.numMentions ?? "unknown"} mentions across ${props.numSources ?? "unknown"} sources.`,
+        typeof props.goldsteinScale === "number"
+          ? `Goldstein score ${Number(props.goldsteinScale).toFixed(1)} indicates ${
+              Number(props.goldsteinScale) < 0 ? "conflict pressure" : "cooperative posture"
+            }.`
+          : null,
+        typeof props.avgTone === "number"
+          ? `Average tone is ${Number(props.avgTone).toFixed(2)}.`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    case "satellite":
+      return [
+        `${name} is ${props.isIss ? "the International Space Station" : "a tracked orbital object"}.`,
+        props.orbitType ? `Orbit regime: ${props.orbitType}.` : null,
+        props.countryCode ? `Country code: ${props.countryCode}.` : null,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    case "anomaly":
+      return [
+        `${name} is a Phantom chaos anomaly.`,
+        props.anomaly_type ? `Type: ${props.anomaly_type}.` : null,
+        props.severity ? `Severity: ${props.severity}.` : null,
+        typeof props.chaos_score === "number" ? `Chaos score: ${Number(props.chaos_score).toFixed(2)}.` : null,
+        props.detail ? String(props.detail) : null,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    case "vessel":
+      return [
+        `${name} is an AIS-tracked vessel (MMSI: ${props.mmsi ?? "unknown"}).`,
+        props.country ? `Flag: ${props.country}.` : null,
+        props.isMilitary ? "CLASSIFICATION: POTENTIAL MILITARY VESSEL." : null,
+        props.knownVessel ? `Identified as known naval vessel: ${props.knownVessel}.` : null,
+        typeof props.sog === "number" ? `Speed over ground: ${Number(props.sog).toFixed(1)} knots.` : null,
+        typeof props.cog === "number" ? `Course: ${Number(props.cog).toFixed(0)}°.` : null,
+        props.callsign ? `Callsign: ${props.callsign}.` : null,
+        props.nearChokepoint ? `Currently near strategic chokepoint: ${props.nearChokepoint}.` : null,
+        props.nearBase ? `Proximity to naval base: ${props.nearBase}.` : null,
+        props.isDark ? "WARNING: AIS dark — signal gap exceeds 60 minutes." : null,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    default:
+      return `${name} is the currently selected target. Review quick facts and full facts for supporting context.`;
+  }
+};
+
+const isFlatMapMode = (sceneMode: SceneMode): boolean => sceneMode === "flat_map";
 
 const PRIORITY_THRESHOLDS = {
   earthquakeMagnitude: 4.5,
@@ -133,7 +403,16 @@ const PRIORITY_THRESHOLDS = {
 } as const;
 
 const classifyImportance = (kind: string, props: Record<string, unknown>): IntelImportance => {
-  if (kind === "military") return "important";
+  if (kind === "military" || kind === "threat") return "important";
+  if (kind === "anomaly") {
+    const severity = String(props.severity ?? "");
+    const chaosScore = toNumber(props.chaos_score);
+    if (severity === "Critical" || severity === "High" || (chaosScore !== null && chaosScore >= 0.7)) {
+      return "important";
+    }
+    return "normal";
+  }
+  if (kind === "gdelt" && toNumber(props.goldsteinScale) !== null && (toNumber(props.goldsteinScale)! <= -7)) return "important";
 
   const magnitude = toNumber(props.magnitude);
   if (
@@ -186,6 +465,7 @@ const buildSelectedIntel = (entity: Entity): SelectedIntel | null => {
   switch (kind) {
     case "flight":
       pushQuick("Callsign", props.callsign);
+      pushQuick("Category", props.flightCategory);
       pushQuick("Origin", props.originCountry);
       pushQuick("Velocity (m/s)", props.velocity);
       pushQuick("Track (deg)", props.track);
@@ -207,6 +487,7 @@ const buildSelectedIntel = (entity: Entity): SelectedIntel | null => {
       pushQuick("Depth (km)", props.depthKm);
       break;
     case "satellite":
+      pushQuick("Platform", props.isIss ? "ISS" : "Satellite");
       pushQuick("Name", props.name);
       pushQuick("Type", props.classification);
       pushQuick("Orbit", props.orbitType);
@@ -218,19 +499,80 @@ const buildSelectedIntel = (entity: Entity): SelectedIntel | null => {
       pushQuick("Apogee (km)", props.apogeeKm);
       pushQuick("Perigee (km)", props.perigeeKm);
       break;
-    case "cctv":
-      pushQuick("Camera", props.name);
-      pushQuick("Category", props.category);
-      pushQuick("Provider", props.provider);
+    case "anomaly":
+      if (props.anomalyId) {
+        // Google Earth Anomaly Atlas entry
+        pushQuick("Category", props.category);
+        pushQuick("Status", props.status);
+        const site = ANOMALY_SITES.find((s) => s.id === props.anomalyId);
+        if (site) {
+          return {
+            id: entity.id,
+            name: site.name,
+            kind: "anomaly",
+            importance: site.status === "ambiguous" || site.status === "unexplained" ? "important" : "normal",
+            quickFacts,
+            fullFacts: [],
+            analysisSummary: site.description,
+            coordinates: cartographic ? {
+              lat: CesiumMath.toDegrees(cartographic.latitude),
+              lon: CesiumMath.toDegrees(cartographic.longitude),
+            } : undefined,
+          };
+        }
+      }
+      pushQuick("Type", props.anomaly_type);
+      pushQuick("Severity", props.severity);
+      pushQuick("Chaos Score", props.chaos_score);
+      pushQuick("Detected", props.detected_at);
+      pushQuick("Detail", props.detail);
+      break;
+    case "threat":
+      pushQuick("Adversary", props.adversary);
+      pushQuick("Malware", props.malware);
+      pushQuick("Industries", props.industries);
+      pushQuick("Target", props.targetedCountry);
+      pushQuick("IOCs", props.indicators);
+      pushQuick("TLP", props.tlp);
+      pushQuick("Tags", props.tags);
+      break;
+    case "gdelt":
+      pushQuick("Actor 1", `${props.actor1Name ?? ""} (${props.actor1Country ?? ""})`);
+      pushQuick("Actor 2", `${props.actor2Name ?? ""} (${props.actor2Country ?? ""})`);
+      pushQuick("Event Code", props.eventCode);
+      pushQuick("Goldstein", props.goldsteinScale);
+      pushQuick("Mentions", props.numMentions);
+      pushQuick("Tone", props.avgTone);
+      pushQuick("Location", props.actionGeoName);
+      pushQuick("Source", props.sourceUrl);
+      break;
+    case "vessel":
+      pushQuick("MMSI", props.mmsi);
+      pushQuick("Name", props.vesselName);
+      pushQuick("Callsign", props.callsign);
+      pushQuick("Speed (kn)", props.sog);
+      pushQuick("Course", props.cog);
+      pushQuick("Heading", props.heading);
+      pushQuick("Nav Status", props.navStatus);
+      pushQuick("Country", props.country);
+      if (props.isMilitary) pushQuick("Classification", "MILITARY");
+      if (props.knownVessel) pushQuick("Known Vessel", props.knownVessel);
+      if (props.nearChokepoint) pushQuick("Near Chokepoint", props.nearChokepoint);
+      if (props.nearBase) pushQuick("Near Base", props.nearBase);
+      if (props.isDark) pushQuick("AIS Status", "DARK (gap > 60 min)");
       break;
     default:
       break;
   }
 
+  const quickLabels = new Set(quickFacts.map((f) => f.label));
   const fullFacts: IntelDatum[] = [{ label: "Entity ID", value: entity.id }];
   for (const [key, value] of Object.entries(props)) {
     if (value === null || value === undefined || key === "kind") continue;
-    fullFacts.push({ label: key, value: formatValue(value) });
+    const formatted = formatValue(value);
+    // Skip properties already shown in quickFacts
+    if (quickLabels.has(key) || quickFacts.some((f) => f.value === formatted)) continue;
+    fullFacts.push({ label: key, value: formatted });
   }
 
   if (cartographic) {
@@ -258,13 +600,33 @@ const buildSelectedIntel = (entity: Entity): SelectedIntel | null => {
         ? props.imageUrl
         : undefined,
     streamUrl: typeof props.streamUrl === "string" ? props.streamUrl : undefined,
+    externalUrl:
+      (kind === "flight" || kind === "military")
+        ? buildFlightAwareUrl(props.callsign)
+        : typeof props.sourceUrl === "string"
+          ? props.sourceUrl
+          : undefined,
+    externalLabel:
+      kind === "flight" || kind === "military"
+        ? "FlightAware"
+        : typeof props.sourceUrl === "string"
+          ? "Source Link"
+          : undefined,
+    analysisSummary: buildAnalysisSummary(kind, props, name),
+    coordinates: cartographic
+      ? {
+          lat: CesiumMath.toDegrees(cartographic.latitude),
+          lon: CesiumMath.toDegrees(cartographic.longitude),
+          altMeters: cartographic.height,
+        }
+      : undefined,
   };
 };
 
 const generateCirclePositions = (center: Cartesian3, radius: number, segments = 64): Cartesian3[] => {
   const positions: Cartesian3[] = [];
   const cartographic = Cartographic.fromCartesian(center);
-  for (let i = 0; i <= segments; i++) {
+  for (let i = 0; i < segments; i++) {
     const angle = (i / segments) * 2 * Math.PI;
     const lat = cartographic.latitude + (radius / 6371000) * Math.cos(angle);
     const lon = cartographic.longitude + (radius / (6371000 * Math.cos(cartographic.latitude))) * Math.sin(angle);
@@ -281,33 +643,105 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
   const militaryLayerRef = useRef<MilitaryLayer | null>(null);
   const satLayerRef = useRef<SatelliteLayer | null>(null);
   const seismicLayerRef = useRef<SeismicLayer | null>(null);
-  const cctvLayerRef = useRef<CctvLayer | null>(null);
+  const basesLayerRef = useRef<BasesLayer | null>(null);
+  const outageLayerRef = useRef<OutageLayer | null>(null);
+  const threatLayerRef = useRef<ThreatLayer | null>(null);
+  const gdeltLayerRef = useRef<GdeltLayer | null>(null);
   const rasterLayerRef = useRef<RasterLayer | null>(null);
+  const sentinelLayerRef = useRef<RasterLayer | null>(null);
+  const anomalyLayerRef = useRef<AnomalyLayer | null>(null);
+  const weatherLayerRef = useRef<WeatherLayer | null>(null);
+  const vesselLayerRef = useRef<VesselLayer | null>(null);
   const visualModeRef = useRef<VisualModeController | null>(null);
   const pickerRef = useRef<ScreenSpaceEventHandler | null>(null);
   const platformModeRef = useRef<PlatformMode>("live");
-  const recordingBufferRef = useRef<RecordingBuffer>(new RecordingBuffer());
   const satRecordsRef = useRef<SatelliteRecord[]>([]);
-  const playbackEngineRef = useRef<PlaybackEngine | null>(null);
   const hoveredEntityRef = useRef<Entity | null>(null);
   const hoveredOriginalSizeRef = useRef<number | null>(null);
+  const hoveredOriginalScaleRef = useRef<number | null>(null);
   const selectionRingRef = useRef<Entity | null>(null);
 
   const flightAlertsRef = useRef<IntelAlert[]>([]);
   const militaryAlertsRef = useRef<IntelAlert[]>([]);
   const satelliteAlertsRef = useRef<IntelAlert[]>([]);
   const seismicAlertsRef = useRef<IntelAlert[]>([]);
+  const phantomAlertsRef = useRef<IntelAlert[]>([]);
+  const phantomRawRef = useRef<PhantomAnomaly[]>([]);
 
   const [selectedIntel, setSelectedIntel] = useState<SelectedIntel | null>(null);
   const [showFullIntel, setShowFullIntel] = useState(false);
   const [analyticsStatus, setAnalyticsStatus] = useState<string | null>(null);
   const [collisionEnabled, setCollisionEnabled] = useState(false);
+  const pushIncidents = useEpicFuryStore((s) => s.pushIncidents);
+  const setEpicFuryActive = useEpicFuryStore((s) => s.setActive);
+  const collisionEnabledRef = useRef(collisionEnabled);
+  useEffect(() => {
+    collisionEnabledRef.current = collisionEnabled;
+  }, [collisionEnabled]);
 
   const layers = useArgusStore((s) => s.layers);
   const platformMode = useArgusStore((s) => s.platformMode);
+  const epicFuryActive = platformMode === "epic-fury";
+
+  // Sync Epic Fury store with platform mode
+  useEffect(() => {
+    setEpicFuryActive(epicFuryActive);
+  }, [epicFuryActive, setEpicFuryActive]);
+
+  // Fly to Strait of Hormuz when Epic Fury activates
+  useEffect(() => {
+    if (!epicFuryActive) return;
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    viewer.camera.flyTo({
+      destination: Cartesian3.fromDegrees(56.25, 26.5667, 250_000),
+      duration: 2.0,
+    });
+  }, [epicFuryActive]);
+
+  // Anomaly Atlas — load static markers once on viewer init
+  const anomalyAtlasLoadedRef = useRef(false);
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer || anomalyAtlasLoadedRef.current) return;
+    anomalyAtlasLoadedRef.current = true;
+
+    for (const site of ANOMALY_SITES) {
+      const color = Color.fromCssColorString(CATEGORY_COLORS[site.category]);
+      const markerSvg = createAnomalyMarkerSvg(site.category, CATEGORY_COLORS[site.category]);
+      viewer.entities.add({
+        id: `anomaly-${site.id}`,
+        position: Cartesian3.fromDegrees(site.lon, site.lat, 0),
+        billboard: {
+          image: markerSvg,
+          scale: 0.7,
+          verticalOrigin: VerticalOrigin.CENTER,
+          scaleByDistance: new NearFarScalar(500_000, 1.2, 15_000_000, 0.35),
+          disableDepthTestDistance: 500_000,
+        },
+        label: {
+          text: site.name.length > 30 ? site.name.slice(0, 28) + "\u2026" : site.name,
+          font: "10px monospace",
+          fillColor: color,
+          outlineColor: Color.BLACK,
+          outlineWidth: 2,
+          style: LabelStyle.FILL_AND_OUTLINE,
+          verticalOrigin: VerticalOrigin.BOTTOM,
+          pixelOffset: new Cartesian2(0, -14),
+          scaleByDistance: new NearFarScalar(300_000, 1.0, 2_000_000, 0.0),
+          disableDepthTestDistance: 300_000,
+        },
+        properties: {
+          kind: "anomaly",
+          anomalyId: site.id,
+          category: site.category,
+          status: site.status,
+        },
+      });
+    }
+  }, []);
+
   const analyticsLayers = useArgusStore((s) => s.analyticsLayers);
-  const activeGfsCogPath = useArgusStore((s) => s.activeGfsCogPath);
-  const setActiveGfsCogPath = useArgusStore((s) => s.setActiveGfsCogPath);
   const visualMode = useArgusStore((s) => s.visualMode);
   const visualIntensity = useArgusStore((s) => s.visualIntensity);
   const visualParams = useArgusStore((s) => s.visualParams);
@@ -319,13 +753,16 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
   const setIntelBriefing = useArgusStore((s) => s.setIntelBriefing);
   const trackedEntityId = useArgusStore((s) => s.trackedEntityId);
   const setTrackedEntityId = useArgusStore((s) => s.setTrackedEntityId);
-  const setCameras = useArgusStore((s) => s.setCameras);
   const searchQuery = useArgusStore((s) => s.searchQuery);
+  const sceneMode = useArgusStore((s) => s.sceneMode);
+  const dayNight = useArgusStore((s) => s.dayNight);
   const setSearchResults = useArgusStore((s) => s.setSearchResults);
   const setPlaybackTimeRange = useArgusStore((s) => s.setPlaybackTimeRange);
   const setPlaybackCurrentTime = useArgusStore((s) => s.setPlaybackCurrentTime);
+  const setPlaybackTime = useArgusStore((s) => s.setPlaybackTime);
   const setIsPlaying = useArgusStore((s) => s.setIsPlaying);
-  const playbackSpeed = useArgusStore((s) => s.playbackSpeed);
+  const clickedCoordinates = useArgusStore((s) => s.clickedCoordinates);
+  const setClickedCoordinates = useArgusStore((s) => s.setClickedCoordinates);
 
   const flyToPoi = useCallback((poiId: string) => {
     const viewer = viewerRef.current;
@@ -359,19 +796,107 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
     setCollisionEnabled((current) => !current);
   }, []);
 
+  const zoomIn = useCallback(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    const height = viewer.camera.positionCartographic.height;
+    const target = Math.max(height * 0.5, 15);
+    viewer.camera.zoomIn(height - target);
+  }, []);
+
+  const zoomOut = useCallback(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    const height = viewer.camera.positionCartographic.height;
+    const target = Math.min(height * 2, 60_000_000);
+    viewer.camera.zoomOut(target - height);
+  }, []);
+
+  const tiltUp = useCallback(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    viewer.camera.lookUp(CesiumMath.toRadians(10));
+  }, []);
+
+  const tiltDown = useCallback(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    viewer.camera.lookDown(CesiumMath.toRadians(10));
+  }, []);
+
+  const rotateLeft = useCallback(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    viewer.camera.rotateLeft(CesiumMath.toRadians(15));
+  }, []);
+
+  const rotateRight = useCallback(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    viewer.camera.rotateRight(CesiumMath.toRadians(15));
+  }, []);
+
   const flyToSelectedEntity = useCallback(() => {
     const viewer = viewerRef.current;
     if (!viewer || !selectedIntel) return;
 
     const entity = viewer.entities.getById(selectedIntel.id);
-    if (!entity) return;
+
+    // Fallback for intel items that are not Cesium entities (e.g. live feeds/news)
+    if (!entity) {
+      if (!selectedIntel.coordinates) return;
+
+      setClickedCoordinates({
+        lat: selectedIntel.coordinates.lat,
+        lon: selectedIntel.coordinates.lon,
+        altMeters: selectedIntel.coordinates.altMeters ?? null,
+      });
+
+      const cameraAlt = viewer.camera.positionCartographic.height;
+      const targetAlt = Math.max(cameraAlt, 500_000);
+      viewer.camera.flyTo({
+        destination: Cartesian3.fromDegrees(
+          selectedIntel.coordinates.lon,
+          selectedIntel.coordinates.lat,
+          targetAlt,
+        ),
+        duration: 1.5,
+      });
+      return;
+    }
 
     const position = entity.position?.getValue(JulianDate.now());
-    if (!position) return;
+    if (!position) {
+      if (!selectedIntel.coordinates) return;
+
+      setClickedCoordinates({
+        lat: selectedIntel.coordinates.lat,
+        lon: selectedIntel.coordinates.lon,
+        altMeters: selectedIntel.coordinates.altMeters ?? null,
+      });
+
+      const cameraAlt = viewer.camera.positionCartographic.height;
+      const targetAlt = Math.max(cameraAlt, 500_000);
+      viewer.camera.flyTo({
+        destination: Cartesian3.fromDegrees(
+          selectedIntel.coordinates.lon,
+          selectedIntel.coordinates.lat,
+          targetAlt,
+        ),
+        duration: 1.5,
+      });
+      return;
+    }
 
     const cameraAlt = viewer.camera.positionCartographic.height;
     const targetAlt = Math.max(cameraAlt, 50_000);
     const cartographic = Cartographic.fromCartesian(position);
+
+    setClickedCoordinates({
+      lat: CesiumMath.toDegrees(cartographic.latitude),
+      lon: CesiumMath.toDegrees(cartographic.longitude),
+      altMeters: cartographic.height,
+    });
 
     viewer.camera.flyTo({
       destination: Cartesian3.fromRadians(
@@ -381,7 +906,7 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
       ),
       duration: 1.5,
     });
-  }, [selectedIntel]);
+  }, [selectedIntel, setClickedCoordinates]);
 
   const handleTrackEntity = useCallback(
     (entityId: string | null) => {
@@ -453,8 +978,9 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
       timeline: false,
       shouldAnimate: true,
     });
+    const restoreErrorPanelSuppression = suppressCesiumErrorPanels(viewer);
     const cameraController = viewer.scene.screenSpaceCameraController;
-    cameraController.enableCollisionDetection = collisionEnabled;
+    cameraController.enableCollisionDetection = collisionEnabledRef.current;
     cameraController.inertiaSpin = 0.82;
     cameraController.inertiaTranslate = 0.82;
     cameraController.inertiaZoom = 0.74;
@@ -462,6 +988,7 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
     cameraController.maximumZoomDistance = 60_000_000;
 
     viewer.scene.globe.enableLighting = true;
+    viewer.scene.globe.baseColor = Color.fromCssColorString("#0b1118");
     if (process.env.NEXT_PUBLIC_CESIUM_ION_TOKEN) {
       void createWorldTerrainAsync({
         requestVertexNormals: true,
@@ -493,8 +1020,16 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
     const militaryLayer = new MilitaryLayer(viewer);
     const satLayer = new SatelliteLayer(viewer);
     const seismicLayer = new SeismicLayer(viewer);
-    const cctvLayer = new CctvLayer(viewer);
+    const basesLayer = new BasesLayer(viewer);
+    const outageLayer = new OutageLayer(viewer);
+    const threatLayer = new ThreatLayer(viewer);
+    const gdeltLayer = new GdeltLayer(viewer);
+    const anomalyLayer = new AnomalyLayer(viewer);
+    const vesselLayer = new VesselLayer(viewer);
+    const weatherLayer = new WeatherLayer(viewer);
+    void weatherLayer.init();
     const rasterLayer = new RasterLayer(viewer);
+    const sentinelLayer = new RasterLayer(viewer);
     const visualController = new VisualModeController(viewer);
     const picker = new ScreenSpaceEventHandler(viewer.scene.canvas);
 
@@ -502,11 +1037,66 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
     militaryLayerRef.current = militaryLayer;
     satLayerRef.current = satLayer;
     seismicLayerRef.current = seismicLayer;
-    cctvLayerRef.current = cctvLayer;
+    basesLayerRef.current = basesLayer;
+    outageLayerRef.current = outageLayer;
+    threatLayerRef.current = threatLayer;
+    gdeltLayerRef.current = gdeltLayer;
+    anomalyLayerRef.current = anomalyLayer;
+    vesselLayerRef.current = vesselLayer;
+    weatherLayerRef.current = weatherLayer;
     rasterLayerRef.current = rasterLayer;
+    sentinelLayerRef.current = sentinelLayer;
+
+    // Load static bases layer immediately
+    const basesCount = basesLayer.load();
+    setCount("bases", basesCount);
     visualModeRef.current = visualController;
     pickerRef.current = picker;
     viewerRef.current = viewer;
+
+    // --- Zoom-box hotspot regions ---
+    for (const zr of ZOOM_REGIONS) {
+      const baseColor = Color.fromCssColorString(zr.color);
+      viewer.entities.add({
+        id: zr.id,
+        name: zr.label,
+        rectangle: {
+          coordinates: Rectangle.fromDegrees(zr.west, zr.south, zr.east, zr.north),
+          material: new ColorMaterialProperty(baseColor.withAlpha(0.08)),
+          outline: true,
+          outlineColor: new ConstantProperty(baseColor.withAlpha(0.45)),
+          outlineWidth: new ConstantProperty(1),
+          height: 0,
+        },
+        label: {
+          text: zr.label,
+          font: "11px monospace",
+          style: LabelStyle.FILL_AND_OUTLINE,
+          outlineWidth: 3,
+          outlineColor: Color.fromCssColorString("#0b1118"),
+          fillColor: baseColor.withAlpha(0.85),
+          horizontalOrigin: HorizontalOrigin.CENTER,
+          verticalOrigin: VerticalOrigin.CENTER,
+          scaleByDistance: new NearFarScalar(1_500_000, 1.2, 20_000_000, 0.4),
+          translucencyByDistance: new NearFarScalar(500_000, 0, 2_000_000, 1),
+          pixelOffset: new Cartesian2(0, 0),
+          showBackground: true,
+          backgroundColor: Color.fromCssColorString("#0b1118").withAlpha(0.55),
+          backgroundPadding: new Cartesian2(6, 3),
+        },
+        position: Cartesian3.fromDegrees(
+          (zr.west + zr.east) / 2,
+          (zr.south + zr.north) / 2,
+          0,
+        ),
+        properties: {
+          zoomRegion: true,
+          zoomHeight: zr.height,
+          centerLon: (zr.west + zr.east) / 2,
+          centerLat: (zr.south + zr.north) / 2,
+        } as unknown as Record<string, unknown>,
+      });
+    }
 
     picker.setInputAction((event: { position: Cartesian2 }) => {
       const picked = viewer.scene.pick(event.position);
@@ -516,8 +1106,47 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
         !("id" in picked) ||
         !(picked.id instanceof Entity)
       ) {
+        const globePosition = viewer.camera.pickEllipsoid(event.position, viewer.scene.globe.ellipsoid);
+        if (globePosition) {
+          const cartographic = Cartographic.fromCartesian(globePosition);
+          setClickedCoordinates({
+            lat: CesiumMath.toDegrees(cartographic.latitude),
+            lon: CesiumMath.toDegrees(cartographic.longitude),
+            altMeters: cartographic.height,
+          });
+        }
         setSelectedIntel(null);
         setShowFullIntel(false);
+        return;
+      }
+
+      // Handle zoom-region box clicks — fly to region center
+      const clickedEntity = picked.id as Entity;
+      if (clickedEntity.id?.startsWith("zr-") && clickedEntity.properties) {
+        const props = clickedEntity.properties;
+        const cLon = props.centerLon?.getValue(JulianDate.now()) as number | undefined;
+        const cLat = props.centerLat?.getValue(JulianDate.now()) as number | undefined;
+        const zH = props.zoomHeight?.getValue(JulianDate.now()) as number | undefined;
+        if (cLon != null && cLat != null && zH != null) {
+          viewer.camera.flyTo({
+            destination: Cartesian3.fromDegrees(cLon, cLat, zH),
+            duration: 1.8,
+          });
+          // Lock region in EPIC FURY mode
+          if (useEpicFuryStore.getState().active) {
+            const region = ZOOM_REGIONS.find((r) => r.id === clickedEntity.id);
+            if (region) {
+              useEpicFuryStore.getState().lockRegion({
+                id: region.id,
+                label: region.label,
+                west: region.west,
+                south: region.south,
+                east: region.east,
+                north: region.north,
+              });
+            }
+          }
+        }
         return;
       }
 
@@ -530,6 +1159,15 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
 
       setSelectedIntel(intel);
       setShowFullIntel(intel.importance === "important");
+      setClickedCoordinates(
+        intel.coordinates
+          ? {
+              lat: intel.coordinates.lat,
+              lon: intel.coordinates.lon,
+              altMeters: intel.coordinates.altMeters ?? null,
+            }
+          : null,
+      );
 
       if (intel.kind === "flight" || intel.kind === "military") {
         const rawId = intel.id.replace(/^(flight-|mil-)/, "");
@@ -540,6 +1178,32 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
             );
           }
         });
+      }
+
+      if (intel.kind === "satellite" && /iss|zarya/i.test(intel.name)) {
+        void fetchIssIntel(ARGUS_CONFIG.endpoints.iss)
+          .then((iss) => {
+            const crewLine = iss.crew.length > 0 ? iss.crew.join(", ") : "Crew data unavailable";
+            setSelectedIntel((prev) => {
+              if (!prev || prev.id !== intel.id) return prev;
+              return {
+                ...prev,
+                quickFacts: [
+                  ...prev.quickFacts.filter((fact) => fact.label !== "Crew Aboard"),
+                  { label: "Crew Aboard", value: `${iss.crew.length}` },
+                ],
+                fullFacts: [
+                  ...prev.fullFacts.filter((fact) => fact.label !== "ISS Crew"),
+                  { label: "ISS Crew", value: crewLine },
+                ],
+                streamUrl: iss.videoUrl ?? prev.streamUrl,
+                externalUrl: iss.moreInfoUrl ?? prev.externalUrl,
+                externalLabel: "NASA ISS",
+                analysisSummary: `${prev.analysisSummary ?? "ISS track acquired."} Crew aboard: ${crewLine}.`,
+              };
+            });
+          })
+          .catch(() => undefined);
       }
     }, ScreenSpaceEventType.LEFT_CLICK);
 
@@ -557,18 +1221,36 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
         if (hoveredEntityRef.current.point && hoveredOriginalSizeRef.current !== null) {
           hoveredEntityRef.current.point.pixelSize = hoveredOriginalSizeRef.current as unknown as import("cesium").Property;
         }
+        if (hoveredEntityRef.current.billboard && hoveredOriginalScaleRef.current !== null) {
+          hoveredEntityRef.current.billboard.scale = hoveredOriginalScaleRef.current as unknown as import("cesium").Property;
+        }
         hoveredEntityRef.current = null;
         hoveredOriginalSizeRef.current = null;
+        hoveredOriginalScaleRef.current = null;
       }
 
-      if (newEntity && newEntity.point && newEntity !== hoveredEntityRef.current) {
-        const currentSize = newEntity.point.pixelSize;
-        const sizeValue = typeof currentSize === "object" && currentSize !== null && "getValue" in currentSize
-          ? (currentSize as { getValue: (time: JulianDate) => number }).getValue(JulianDate.now())
-          : (currentSize as unknown as number);
-        hoveredOriginalSizeRef.current = sizeValue;
-        newEntity.point.pixelSize = (sizeValue * 1.5) as unknown as import("cesium").Property;
-        hoveredEntityRef.current = newEntity;
+      if (newEntity && newEntity !== hoveredEntityRef.current) {
+        if (newEntity.point) {
+          const currentSize = newEntity.point.pixelSize;
+          const sizeValue =
+            typeof currentSize === "object" && currentSize !== null && "getValue" in currentSize
+              ? (currentSize as { getValue: (time: JulianDate) => number }).getValue(JulianDate.now())
+              : (currentSize as unknown as number);
+          hoveredOriginalSizeRef.current = sizeValue;
+          hoveredOriginalScaleRef.current = null;
+          newEntity.point.pixelSize = (sizeValue * 1.5) as unknown as import("cesium").Property;
+          hoveredEntityRef.current = newEntity;
+        } else if (newEntity.billboard) {
+          const currentScale = newEntity.billboard.scale;
+          const scaleValue =
+            typeof currentScale === "object" && currentScale !== null && "getValue" in currentScale
+              ? (currentScale as { getValue: (time: JulianDate) => number }).getValue(JulianDate.now())
+              : (currentScale as unknown as number);
+          hoveredOriginalScaleRef.current = scaleValue;
+          hoveredOriginalSizeRef.current = null;
+          newEntity.billboard.scale = (scaleValue * 1.3) as unknown as import("cesium").Property;
+          hoveredEntityRef.current = newEntity;
+        }
       }
     }, ScreenSpaceEventType.MOUSE_MOVE);
 
@@ -615,7 +1297,40 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
           setCount("flights", count);
           setFeedHealthy("opensky");
           flightAlertsRef.current = analyzeFlights(bounded);
-          recordingBufferRef.current.pushFlights(Date.now(), bounded);
+          recordFlights(bounded);
+
+          // Phantom anomaly detection (non-blocking, via server proxy)
+          fetch("/api/phantom/flight", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ flights: bounded.map((f) => ({
+              flight_id: f.id, callsign: f.callsign,
+              lat: f.latitude, lon: f.longitude,
+              altitude: f.altitudeMeters, velocity: f.velocity,
+              timestamp: Date.now() / 1000,
+            })) }),
+            signal: AbortSignal.timeout(5000),
+          })
+            .then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.json(); })
+            .then(({ anomalies }: { anomalies: PhantomAnomaly[] }) => {
+              if (anomalies.length > 0) {
+                phantomAlertsRef.current = [
+                  ...phantomAlertsRef.current.filter(
+                    (a) => Date.now() - a.timestamp < 60_000,
+                  ),
+                  ...analyzePhantomResults(anomalies),
+                ];
+                phantomRawRef.current = anomalies;
+                if (useArgusStore.getState().layers.anomalies) {
+                  anomalyLayer.update(anomalies);
+                  setCount("anomalies", anomalies.length);
+                }
+                setFeedHealthy("phantom");
+              }
+            })
+            .catch(() => {
+              // Phantom is optional — don't set feed error on every miss
+            });
         } catch (error) {
           setFeedError(
             "opensky",
@@ -636,8 +1351,9 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
           const count = militaryLayer.upsertFlights(bounded);
           setCount("military", count);
           setFeedHealthy("adsb");
+          pushIncidents(mapMilitaryIncidents(bounded));
           militaryAlertsRef.current = analyzeMilitary(bounded);
-          recordingBufferRef.current.pushMilitary(Date.now(), bounded);
+          recordMilitary(bounded);
         } catch (error) {
           setFeedError("adsb", error instanceof Error ? error.message : "Failed to fetch ADS-B");
         }
@@ -665,11 +1381,12 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
             ARGUS_CONFIG.limits.orbitSampleStepMinutes,
           );
           setCount("satellites", count);
+          setCount("satelliteLinks", satLayer.getLinkCount());
           setFeedHealthy("celestrak");
           satelliteAlertsRef.current = analyzeSatellites(count);
           if (satRecordsRef.current.length > 0) {
             const positions = computeSatellitePositions(satRecordsRef.current, new Date());
-            recordingBufferRef.current.pushSatellites(Date.now(), positions);
+            recordSatellites(positions);
           }
         } catch (error) {
           setFeedError(
@@ -690,7 +1407,44 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
           const count = seismicLayer.upsertEarthquakes(quakes);
           setCount("seismic", count);
           setFeedHealthy("usgs");
+          pushIncidents(mapSeismicIncidents(quakes));
           seismicAlertsRef.current = analyzeSeismic(count);
+          recordQuakes(quakes);
+
+          // Phantom seismic anomaly detection (non-blocking, via server proxy)
+          fetch("/api/phantom/seismic", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ events: quakes.map((q) => ({
+              id: q.id, lat: q.latitude, lon: q.longitude,
+              magnitude: q.magnitude, depth_km: q.depthKm,
+              timestamp: q.timestamp / 1000,
+            })) }),
+            signal: AbortSignal.timeout(5000),
+          })
+            .then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.json(); })
+            .then(({ anomalies }: { anomalies: PhantomAnomaly[] }) => {
+              if (anomalies.length > 0) {
+                phantomAlertsRef.current = [
+                  ...phantomAlertsRef.current.filter(
+                    (a) => Date.now() - a.timestamp < 300_000,
+                  ),
+                  ...analyzePhantomResults(anomalies),
+                ];
+                phantomRawRef.current = [
+                  ...phantomRawRef.current.filter(
+                    (a) => a.anomaly_type !== "magnitude_chaos" && a.anomaly_type !== "depth_cluster_chaos",
+                  ),
+                  ...anomalies,
+                ];
+                if (useArgusStore.getState().layers.anomalies) {
+                  anomalyLayer.update(phantomRawRef.current);
+                  setCount("anomalies", phantomRawRef.current.length);
+                }
+                setFeedHealthy("phantom");
+              }
+            })
+            .catch(() => {});
         } catch (error) {
           setFeedError("usgs", error instanceof Error ? error.message : "Failed to fetch USGS");
         }
@@ -698,31 +1452,87 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
     });
 
     poller.add({
-      id: "cctv",
-      intervalMs: ARGUS_CONFIG.pollMs.cctv,
+      id: "cloudflare-radar",
+      intervalMs: ARGUS_CONFIG.pollMs.cloudflareRadar,
       run: async () => {
-        if (platformModeRef.current !== "live") return;
         try {
-          const cameras = await fetchCctvCameras(ARGUS_CONFIG.endpoints.cctv, ARGUS_CONFIG.endpoints.webcams);
-          setCameras(cameras);
-          const categoryFilter = useArgusStore.getState().cctvCategoryFilter;
-          const filtered = categoryFilter === "All"
-            ? cameras
-            : cameras.filter((c) => c.category === categoryFilter);
-          const count = cctvLayer.upsertCameras(filtered.slice(0, ARGUS_CONFIG.limits.maxCctv));
-          setCount("cctv", count);
-          setFeedHealthy("tfl");
+          const outages = await fetchInternetOutages(ARGUS_CONFIG.endpoints.cloudflareRadar);
+          const count = outageLayer.update(outages);
+          setCount("outages", count);
+          setFeedHealthy("cfradar");
+          recordOutages(outages);
         } catch (error) {
-          setFeedError("tfl", error instanceof Error ? error.message : "Failed to fetch CCTV");
+          setFeedError("cfradar", error instanceof Error ? error.message : "Failed to fetch CF Radar");
+        }
+      },
+    });
+
+    poller.add({
+      id: "otx",
+      intervalMs: ARGUS_CONFIG.pollMs.otx,
+      run: async () => {
+        try {
+          const threats = await fetchThreatPulses(ARGUS_CONFIG.endpoints.otx);
+          const count = threatLayer.update(threats);
+          setCount("threats", count);
+          setFeedHealthy("otx");
+          recordThreats(threats);
+        } catch (error) {
+          setFeedError("otx", error instanceof Error ? error.message : "Failed to fetch OTX");
+        }
+      },
+    });
+
+    poller.add({
+      id: "fred",
+      intervalMs: ARGUS_CONFIG.pollMs.fred,
+      run: async () => {
+        try {
+          await fetchFredObservations(ARGUS_CONFIG.endpoints.fred);
+          setFeedHealthy("fred");
+        } catch (error) {
+          setFeedError("fred", error instanceof Error ? error.message : "Failed to fetch FRED");
+        }
+      },
+    });
+
+    poller.add({
+      id: "aisstream",
+      intervalMs: ARGUS_CONFIG.pollMs.aisstream,
+      run: async () => {
+        try {
+          const vessels = await fetchAisVessels(ARGUS_CONFIG.endpoints.aisstream);
+          const count = vesselLayer.upsertVessels(vessels);
+          setCount("vessels", count);
+          setFeedHealthy("ais");
+          pushIncidents(mapVesselIncidents(vessels));
+        } catch (error) {
+          setFeedError("ais", error instanceof Error ? error.message : "Failed to fetch AISStream");
+        }
+      },
+    });
+
+    poller.add({
+      id: "gdelt",
+      intervalMs: ARGUS_CONFIG.pollMs.gdelt,
+      run: async () => {
+        try {
+          const events = await fetchGdeltEvents(ARGUS_CONFIG.endpoints.gdelt);
+          const count = gdeltLayer.update(events);
+          setCount("gdelt", count);
+          setFeedHealthy("gdelt");
+          pushIncidents(mapGdeltIncidents(events));
+        } catch (error) {
+          setFeedError("gdelt", error instanceof Error ? error.message : "Failed to fetch GDELT");
         }
       },
     });
 
     return () => {
       poller.stopAll();
-      playbackEngineRef.current?.clear();
       rasterLayer.unload();
       viewer.camera.changed.removeEventListener(onCameraChanged);
+      restoreErrorPanelSuppression();
 
       if (selectionRingRef.current) {
         viewer.entities.remove(selectionRingRef.current);
@@ -730,7 +1540,9 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
       }
       hoveredEntityRef.current = null;
       hoveredOriginalSizeRef.current = null;
+      hoveredOriginalScaleRef.current = null;
 
+      weatherLayer.destroy();
       picker.destroy();
       visualController.destroy();
       viewer.destroy();
@@ -740,12 +1552,127 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
       militaryLayerRef.current = null;
       satLayerRef.current = null;
       seismicLayerRef.current = null;
-      cctvLayerRef.current = null;
+      basesLayerRef.current = null;
+      outageLayerRef.current = null;
+      threatLayerRef.current = null;
+      gdeltLayerRef.current = null;
       rasterLayerRef.current = null;
+      weatherLayerRef.current = null;
       visualModeRef.current = null;
       pickerRef.current = null;
     };
-  }, [setCamera, setCount, setFeedError, setFeedHealthy]);
+  }, [pushIncidents, setCamera, setClickedCoordinates, setCount, setFeedError, setFeedHealthy]);
+
+  // DVR playback data loop
+  const playbackModeState = useArgusStore((s) => s.platformMode);
+  useEffect(() => {
+    if (playbackModeState !== "playback") return;
+
+    let animFrameId: number;
+    let lastFrameTime = performance.now();
+    let lastFetchTime = 0;
+    const FETCH_INTERVAL = 500;
+
+    const tick = async (now: number) => {
+      const state = useArgusStore.getState();
+      if (state.platformMode !== "playback") return;
+
+      if (state.isPlaying && state.playbackTime) {
+        const delta = (now - lastFrameTime) / 1000;
+        const maxTime = state.playbackTimeRange?.end ?? Number.POSITIVE_INFINITY;
+        const nextTimeMs = Math.min(
+          state.playbackTime.getTime() + delta * state.playbackSpeed * 1000,
+          maxTime,
+        );
+        useArgusStore.setState({
+          playbackTime: new Date(nextTimeMs),
+          playbackCurrentTime: nextTimeMs,
+          isPlaying: nextTimeMs < maxTime ? state.isPlaying : false,
+        });
+      }
+      lastFrameTime = now;
+
+      if (now - lastFetchTime < FETCH_INTERVAL) {
+        animFrameId = requestAnimationFrame(tick);
+        return;
+      }
+      lastFetchTime = now;
+
+      const currentPlaybackTime = useArgusStore.getState().playbackTime;
+      if (!currentPlaybackTime || !viewerRef.current) {
+        animFrameId = requestAnimationFrame(tick);
+        return;
+      }
+
+      const ts = currentPlaybackTime.toISOString();
+
+      try {
+        const [flightsRes, milRes, satRes, quakeRes, outageRes, threatRes] =
+          await Promise.all([
+            fetch(`/api/playback/flights?ts=${ts}&window=30`).then((r) =>
+              r.json(),
+            ),
+            fetch(`/api/playback/military?ts=${ts}&window=30`).then((r) =>
+              r.json(),
+            ),
+            fetch(`/api/playback/satellites?ts=${ts}&window=30`).then((r) =>
+              r.json(),
+            ),
+            fetch(`/api/playback/quakes?ts=${ts}&window=30`).then((r) =>
+              r.json(),
+            ),
+            fetch(`/api/playback/outages?ts=${ts}&window=30`).then((r) =>
+              r.json(),
+            ),
+            fetch(`/api/playback/threats?ts=${ts}&window=30`).then((r) =>
+              r.json(),
+            ),
+          ]);
+
+        const { layers: activeLayers, setCount } = useArgusStore.getState();
+
+        if (flightLayerRef.current && flightsRes.flights) {
+          flightLayerRef.current.upsertFlights(flightsRes.flights);
+          setCount("flights", flightsRes.flights.length);
+          flightLayerRef.current.setVisible(activeLayers.flights);
+        }
+        if (militaryLayerRef.current && milRes.flights) {
+          militaryLayerRef.current.upsertFlights(milRes.flights);
+          setCount("military", milRes.flights.length);
+          militaryLayerRef.current.setVisible(activeLayers.military);
+        }
+        if (satLayerRef.current && satRes.satellites) {
+          satLayerRef.current.upsertPlaybackSatellites(satRes.satellites);
+          satLayerRef.current.setVisible(activeLayers.satellites);
+          satLayerRef.current.setLinkVisible(false);
+          setCount("satellites", satRes.satellites.length);
+          setCount("satelliteLinks", 0);
+        }
+        if (seismicLayerRef.current && quakeRes.quakes) {
+          seismicLayerRef.current.upsertEarthquakes(quakeRes.quakes);
+          setCount("seismic", quakeRes.quakes.length);
+          seismicLayerRef.current.setVisible(activeLayers.seismic);
+        }
+        if (outageLayerRef.current && outageRes.outages) {
+          outageLayerRef.current.update(outageRes.outages);
+          setCount("outages", outageRes.outages.length);
+          outageLayerRef.current.setVisible(activeLayers.outages);
+        }
+        if (threatLayerRef.current && threatRes.threats) {
+          threatLayerRef.current.update(threatRes.threats);
+          setCount("threats", threatRes.threats.length);
+          threatLayerRef.current.setVisible(activeLayers.threats);
+        }
+      } catch {
+        // Playback fetch errors are non-critical
+      }
+
+      animFrameId = requestAnimationFrame(tick);
+    };
+
+    animFrameId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animFrameId);
+  }, [playbackModeState]);
 
   // Entity search — watches searchQuery in store, populates searchResults
   useEffect(() => {
@@ -803,6 +1730,7 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
         ...militaryAlertsRef.current,
         ...satelliteAlertsRef.current,
         ...seismicAlertsRef.current,
+        ...phantomAlertsRef.current,
       ];
 
       const briefing = generateBriefing(allAlerts);
@@ -845,9 +1773,43 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
           color: Color.fromCssColorString("#2ad4ff").withAlpha(0.7),
         }),
         clampToGround: false,
+        arcType: ArcType.NONE,
       },
     });
     selectionRingRef.current = ringEntity;
+  }, [selectedIntel]);
+
+  // Show orbit trail only for the selected satellite
+  useEffect(() => {
+    const satLayer = satLayerRef.current;
+    if (!satLayer) return;
+
+    if (selectedIntel?.kind === "satellite") {
+      const rawId = selectedIntel.id.replace(/^sat-/, "");
+      satLayer.showOrbit(
+        rawId,
+        ARGUS_CONFIG.limits.orbitSamples,
+        ARGUS_CONFIG.limits.orbitSampleStepMinutes,
+      );
+    } else {
+      satLayer.showOrbit(null, 0, 0);
+    }
+
+    // Show trail for selected flights/military
+    if (selectedIntel?.kind === "flight") {
+      const rawId = selectedIntel.id.replace(/^flight-/, "");
+      flightLayerRef.current?.showTrail(rawId);
+    } else if (selectedIntel?.kind === "military") {
+      const rawId = selectedIntel.id.replace(/^mil-/, "");
+      militaryLayerRef.current?.showTrail(rawId);
+    } else if (selectedIntel?.kind === "vessel") {
+      const rawId = selectedIntel.id.replace(/^vessel-/, "");
+      vesselLayerRef.current?.showTrail(rawId);
+    } else {
+      flightLayerRef.current?.hideTrail();
+      militaryLayerRef.current?.hideTrail();
+      vesselLayerRef.current?.hideTrail();
+    }
   }, [selectedIntel]);
 
   useEffect(() => {
@@ -856,12 +1818,22 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
 
     if (!trackedEntityId) {
       viewer.trackedEntity = undefined;
+      flightLayerRef.current?.hideTrail();
+      militaryLayerRef.current?.hideTrail();
       return;
     }
 
     const entity = viewer.entities.getById(trackedEntityId);
     if (entity) {
       viewer.trackedEntity = entity;
+      // Show trail for tracked flights
+      if (trackedEntityId.startsWith("flight-")) {
+        const rawId = trackedEntityId.replace("flight-", "");
+        flightLayerRef.current?.showTrail(rawId);
+      } else if (trackedEntityId.startsWith("mil-")) {
+        const rawId = trackedEntityId.replace("mil-", "");
+        militaryLayerRef.current?.showTrail(rawId);
+      }
     }
   }, [trackedEntityId]);
 
@@ -869,118 +1841,231 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
     platformModeRef.current = platformMode;
 
     if (platformMode === "analytics") {
-      if (playbackEngineRef.current) {
-        playbackEngineRef.current.clear();
-        playbackEngineRef.current = null;
-      }
       flightLayerRef.current?.setVisible(false);
       militaryLayerRef.current?.setVisible(false);
       satLayerRef.current?.setVisible(false);
+      satLayerRef.current?.setLinkVisible(false);
       seismicLayerRef.current?.setVisible(false);
-      cctvLayerRef.current?.setVisible(false);
+
+      basesLayerRef.current?.setVisible(false);
+      outageLayerRef.current?.setVisible(layers.outages);
+      threatLayerRef.current?.setVisible(layers.threats);
+      gdeltLayerRef.current?.setVisible(layers.gdelt);
+      anomalyLayerRef.current?.setVisible(layers.anomalies);
+      vesselLayerRef.current?.setVisible(false);
     } else if (platformMode === "playback") {
-      flightLayerRef.current?.setVisible(false);
-      militaryLayerRef.current?.setVisible(false);
-      satLayerRef.current?.setVisible(false);
-      seismicLayerRef.current?.setVisible(false);
-      cctvLayerRef.current?.setVisible(false);
+      const { layers } = useArgusStore.getState();
 
-      const viewer = viewerRef.current;
-      if (viewer && !playbackEngineRef.current) {
-        playbackEngineRef.current = new PlaybackEngine(viewer);
-      }
+      flightLayerRef.current?.setVisible(layers.flights);
+      militaryLayerRef.current?.setVisible(layers.military);
+      satLayerRef.current?.setVisible(layers.satellites);
+      satLayerRef.current?.setLinkVisible(false);
+      seismicLayerRef.current?.setVisible(layers.seismic);
+      basesLayerRef.current?.setVisible(layers.bases);
+      outageLayerRef.current?.setVisible(false);
+      threatLayerRef.current?.setVisible(false);
+      gdeltLayerRef.current?.setVisible(false);
+      anomalyLayerRef.current?.setVisible(false);
+      vesselLayerRef.current?.setVisible(false);
+      setIsPlaying(false);
 
-      const engine = playbackEngineRef.current;
-      if (engine) {
-        const buffer = recordingBufferRef.current;
-        const range = engine.load(
-          buffer.getFlightFrames(),
-          buffer.getMilitaryFrames(),
-          buffer.getSatelliteFrames(),
-        );
-        if (range) {
-          setPlaybackTimeRange(range);
-          setPlaybackCurrentTime(range.start);
-          engine.onTick((timestampMs) => {
-            setPlaybackCurrentTime(timestampMs);
-          });
-        }
-      }
+      void fetch("/api/playback/range", { cache: "no-store" })
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error(`Playback range returned ${response.status}`);
+          }
+          return response.json() as Promise<{ earliest: string | null; latest: string | null }>;
+        })
+        .then((range) => {
+          if (!range.earliest || !range.latest) {
+            setPlaybackTimeRange(null);
+            setPlaybackCurrentTime(0);
+            setPlaybackTime(null);
+            return;
+          }
+
+          const start = new Date(range.earliest).getTime();
+          const end = new Date(range.latest).getTime();
+          setPlaybackTimeRange({ start, end });
+          setPlaybackCurrentTime(end);
+          setPlaybackTime(new Date(end));
+        })
+        .catch(() => {
+          setPlaybackTimeRange(null);
+          setPlaybackCurrentTime(0);
+          setPlaybackTime(null);
+        });
     } else {
       // "live" — clean up playback, restore live layers
-      if (playbackEngineRef.current) {
-        playbackEngineRef.current.clear();
-        playbackEngineRef.current = null;
-      }
       setPlaybackTimeRange(null);
+      setPlaybackCurrentTime(0);
+      setPlaybackTime(null);
       setIsPlaying(false);
 
       const { layers } = useArgusStore.getState();
       flightLayerRef.current?.setVisible(layers.flights);
       militaryLayerRef.current?.setVisible(layers.military);
       satLayerRef.current?.setVisible(layers.satellites);
+      satLayerRef.current?.setLinkVisible(layers.satellites && layers.satelliteLinks);
       seismicLayerRef.current?.setVisible(layers.seismic);
-      cctvLayerRef.current?.setVisible(layers.cctv);
+
+      basesLayerRef.current?.setVisible(layers.bases);
+      outageLayerRef.current?.setVisible(layers.outages);
+      threatLayerRef.current?.setVisible(layers.threats);
+      gdeltLayerRef.current?.setVisible(layers.gdelt);
+      anomalyLayerRef.current?.setVisible(layers.anomalies);
+      vesselLayerRef.current?.setVisible(layers.vessels);
     }
-  }, [platformMode, setIsPlaying, setPlaybackCurrentTime, setPlaybackTimeRange]);
+  }, [layers.gdelt, layers.outages, layers.threats, layers.anomalies, layers.vessels, platformMode, setIsPlaying, setPlaybackCurrentTime, setPlaybackTime, setPlaybackTimeRange]);
+
+  // Fetch analytics tile URLs once on mount, store in refs
+  const gfsTileUrlRef = useRef<string | null>(null);
+  const gfsMaxLevelRef = useRef<number | undefined>(undefined);
+  const sentinelTileUrlRef = useRef<string | null>(null);
+  const sentinelMaxLevelRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
-    if (platformMode !== "analytics") {
-      setAnalyticsStatus(null);
-      return;
-    }
-
     void fetch("/api/analytics/layers", { cache: "no-store" })
       .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(`Analytics endpoint returned ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`Analytics endpoint returned ${response.status}`);
         return response.json() as Promise<AnalyticsResponse>;
       })
       .then((data) => {
-        const gfsLayer = data.layers.find((layer) => layer.variable === "t2m");
-        if (gfsLayer?.tile_url) {
-          setActiveGfsCogPath(gfsLayer.tile_url);
-          setAnalyticsStatus(
-            gfsLayer.source_file
-              ? `Using ${gfsLayer.source_file.split("/").pop()}`
-              : "GFS raster layer ready",
-          );
-          return;
+        for (const layer of data.layers) {
+          if (layer.id === "gfs_precip_radar") {
+            gfsTileUrlRef.current = layer.tileUrl;
+            gfsMaxLevelRef.current = layer.maximumLevel;
+          } else if (layer.id === "sentinel_imagery") {
+            sentinelTileUrlRef.current = layer.tileUrl;
+            sentinelMaxLevelRef.current = layer.maximumLevel;
+          }
         }
-
-        setActiveGfsCogPath(null);
-        setAnalyticsStatus(
-          gfsLayer?.error ??
-            "No GFS raster output found yet. Let the ingestor produce a .tif/.tiff tile source.",
-        );
+        setAnalyticsStatus(`${data.layers.filter((l) => l.available).length} raster layers available`);
       })
-      .catch((error) => {
-        setActiveGfsCogPath(null);
-        setAnalyticsStatus(
-          error instanceof Error ? error.message : "Failed to load analytics layer metadata",
-        );
+      .catch(() => {
+        setAnalyticsStatus("Failed to load analytics layer metadata");
       });
-  }, [platformMode, setActiveGfsCogPath]);
+  }, []);
 
+  // Toggle GFS weather raster based on store toggle
   useEffect(() => {
     const rasterLayer = rasterLayerRef.current;
     if (!rasterLayer) return;
 
-    if (platformMode === "analytics" && analyticsLayers.gfs_weather && activeGfsCogPath) {
-      rasterLayer.load(activeGfsCogPath);
+    if (analyticsLayers.gfs_weather && gfsTileUrlRef.current) {
+      rasterLayer.load(gfsTileUrlRef.current, { maximumLevel: gfsMaxLevelRef.current });
     } else {
       rasterLayer.unload();
     }
-  }, [platformMode, analyticsLayers.gfs_weather, activeGfsCogPath]);
+  }, [analyticsLayers.gfs_weather]);
+
+  // Toggle Sentinel imagery raster based on store toggle
+  useEffect(() => {
+    const sentinel = sentinelLayerRef.current;
+    if (!sentinel) return;
+
+    if (analyticsLayers.sentinel_imagery && sentinelTileUrlRef.current) {
+      sentinel.load(sentinelTileUrlRef.current, { maximumLevel: sentinelMaxLevelRef.current });
+    } else {
+      sentinel.unload();
+    }
+  }, [analyticsLayers.sentinel_imagery]);
 
   useEffect(() => {
+    if (platformMode === "analytics") {
+      flightLayerRef.current?.setVisible(false);
+      militaryLayerRef.current?.setVisible(false);
+      satLayerRef.current?.setVisible(false);
+      satLayerRef.current?.setLinkVisible(false);
+      seismicLayerRef.current?.setVisible(false);
+      basesLayerRef.current?.setVisible(false);
+      outageLayerRef.current?.setVisible(layers.outages);
+      threatLayerRef.current?.setVisible(layers.threats);
+      gdeltLayerRef.current?.setVisible(layers.gdelt);
+      anomalyLayerRef.current?.setVisible(layers.anomalies);
+      vesselLayerRef.current?.setVisible(false);
+      weatherLayerRef.current?.setVisible(layers.weather);
+      return;
+    }
+
     flightLayerRef.current?.setVisible(layers.flights);
     militaryLayerRef.current?.setVisible(layers.military);
     satLayerRef.current?.setVisible(layers.satellites);
+    satLayerRef.current?.setLinkVisible(layers.satellites && layers.satelliteLinks);
     seismicLayerRef.current?.setVisible(layers.seismic);
-    cctvLayerRef.current?.setVisible(layers.cctv);
-  }, [layers.cctv, layers.flights, layers.military, layers.satellites, layers.seismic]);
+    basesLayerRef.current?.setVisible(layers.bases);
+    outageLayerRef.current?.setVisible(layers.outages);
+    threatLayerRef.current?.setVisible(layers.threats);
+    gdeltLayerRef.current?.setVisible(layers.gdelt);
+    anomalyLayerRef.current?.setVisible(layers.anomalies);
+    vesselLayerRef.current?.setVisible(layers.vessels);
+    weatherLayerRef.current?.setVisible(layers.weather);
+  }, [
+    platformMode,
+    layers.bases,
+    layers.flights,
+    layers.gdelt,
+    layers.military,
+    layers.outages,
+    layers.satelliteLinks,
+    layers.satellites,
+    layers.seismic,
+    layers.threats,
+    layers.anomalies,
+    layers.vessels,
+    layers.weather,
+  ]);
+
+  // Globe ↔ Map scene mode toggle
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    // Map mode uses a dedicated non-Cesium flat map panel.
+    // Keep Cesium in 3D for live ingest + smooth return to globe mode.
+    viewer.scene.mode = CesiumSceneMode.SCENE3D;
+    if (isFlatMapMode(sceneMode)) {
+      return;
+    }
+
+    const layers = viewer.imageryLayers;
+    const baseLayer = layers.length > 0 ? layers.get(0) : null;
+    if (baseLayer) {
+      layers.remove(baseLayer, true);
+    }
+
+    const satelliteProvider = new UrlTemplateImageryProvider({
+      url: "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      
+    });
+    const streetProvider = new UrlTemplateImageryProvider({
+      url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      
+    });
+    const darkProvider = new UrlTemplateImageryProvider({
+      url: "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+      
+    });
+
+    const provider =
+      sceneMode === "globe_street"
+        ? streetProvider
+        : sceneMode === "globe_map"
+          ? darkProvider
+          : satelliteProvider;
+
+    layers.addImageryProvider(provider, 0);
+    viewer.scene.globe.baseColor =
+      sceneMode === "globe_map"
+        ? Color.fromCssColorString("#0b1118")
+        : Color.fromCssColorString("#13212b");
+  }, [sceneMode]);
+
+  // Day/Night terminator toggle
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    viewer.scene.globe.enableLighting = dayNight;
+  }, [dayNight]);
 
   useEffect(() => {
     visualModeRef.current?.setMode(visualMode);
@@ -994,31 +2079,25 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
     visualModeRef.current?.setParams(visualParams);
   }, [visualParams]);
 
-  useEffect(() => {
-    playbackEngineRef.current?.setSpeed(playbackSpeed);
-  }, [playbackSpeed]);
-
   const handlePlayPause = useCallback(() => {
-    const engine = playbackEngineRef.current;
-    if (!engine) return;
-    const playing = useArgusStore.getState().isPlaying;
-    if (playing) {
-      engine.pause();
-      setIsPlaying(false);
-    } else {
-      engine.play();
-      setIsPlaying(true);
+    const state = useArgusStore.getState();
+    if (!state.playbackTimeRange) {
+      return;
     }
-  }, [setIsPlaying]);
+
+    if (!state.playbackTime) {
+      const latest = new Date(state.playbackTimeRange.end);
+      setPlaybackCurrentTime(latest.getTime());
+      setPlaybackTime(latest);
+    }
+
+    setIsPlaying(!state.isPlaying);
+  }, [setIsPlaying, setPlaybackCurrentTime, setPlaybackTime]);
 
   const handleSeek = useCallback((timestampMs: number) => {
-    playbackEngineRef.current?.seekTo(timestampMs);
     setPlaybackCurrentTime(timestampMs);
-  }, [setPlaybackCurrentTime]);
-
-  const handlePlaybackSpeedChange = useCallback((speed: number) => {
-    playbackEngineRef.current?.setSpeed(speed);
-  }, []);
+    setPlaybackTime(new Date(timestampMs));
+  }, [setPlaybackCurrentTime, setPlaybackTime]);
 
   return (
     <div className={`relative h-screen w-screen overflow-hidden ${className ?? ""}`}>
@@ -1026,20 +2105,59 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
       <div className="argus-grid pointer-events-none absolute inset-0 z-0" />
 
       <div className="absolute inset-0 z-10 flex items-center justify-center">
-        <div className="argus-viewport">
-          <div ref={mountRef} className="h-full w-full" />
-          {visualMode === "crt" ? (
+        <div className={`argus-viewport ${isFlatMapMode(sceneMode) ? "argus-map-viewport" : ""}`}>
+          <div ref={mountRef} className={isFlatMapMode(sceneMode) ? "hidden" : "h-full w-full"} />
+          {isFlatMapMode(sceneMode) ? (
+            <FlatMapView
+              onSelectIntel={(intel) => {
+                setSelectedIntel(intel);
+                setShowFullIntel(Boolean(intel && intel.importance === "important"));
+                setClickedCoordinates(
+                  intel?.coordinates
+                    ? {
+                        lat: intel.coordinates.lat,
+                        lon: intel.coordinates.lon,
+                        altMeters: intel.coordinates.altMeters ?? null,
+                      }
+                    : null,
+                );
+              }}
+              onSelectCoordinates={(coords) => {
+                setClickedCoordinates(coords);
+                setSelectedIntel({
+                  id: `coords-${coords.lat.toFixed(4)}-${coords.lon.toFixed(4)}`,
+                  name: "Map Coordinates",
+                  kind: "coordinates",
+                  importance: "normal",
+                  quickFacts: [
+                    { label: "Latitude", value: coords.lat.toFixed(4) },
+                    { label: "Longitude", value: coords.lon.toFixed(4) },
+                  ],
+                  fullFacts: [
+                    { label: "Latitude", value: coords.lat.toFixed(6) },
+                    { label: "Longitude", value: coords.lon.toFixed(6) },
+                  ],
+                  coordinates: coords,
+                  analysisSummary: "Manual map selection. Use these coordinates to pivot into nearby entities, incidents, or follow-on analysis.",
+                });
+                setShowFullIntel(false);
+              }}
+            />
+          ) : null}
+          {!isFlatMapMode(sceneMode) && visualMode === "crt" ? (
             <div className="argus-scanlines pointer-events-none absolute inset-0" />
           ) : null}
         </div>
       </div>
+
+      {/* Epic Fury data is shown in sidebar panels when platform mode is epic-fury */}
 
       <HudOverlay
         onFlyToPoi={flyToPoi}
         onResetCamera={resetCamera}
         onToggleCollision={toggleCollisionDetection}
         collisionEnabled={collisionEnabled}
-        analyticsStatus={analyticsStatus}
+        analyticsStatus={platformMode !== "analytics" ? null : analyticsStatus}
         selectedIntel={selectedIntel}
         showFullIntel={showFullIntel}
         onToggleFullIntel={() => setShowFullIntel((current) => !current)}
@@ -1056,9 +2174,16 @@ export function CesiumGlobe({ className }: CesiumGlobeProps) {
         intelBriefing={intelBriefing}
         onFlyToCoordinates={flyToCoordinates}
         onFlyToEntityById={flyToEntityById}
+        onZoomIn={zoomIn}
+        onZoomOut={zoomOut}
+        onTiltUp={tiltUp}
+        onTiltDown={tiltDown}
+        onRotateLeft={rotateLeft}
+        onRotateRight={rotateRight}
         onPlayPause={handlePlayPause}
         onSeek={handleSeek}
-        onPlaybackSpeedChange={handlePlaybackSpeedChange}
+        clickedCoordinates={clickedCoordinates}
+        onSelectIntel={setSelectedIntel}
       />
     </div>
   );

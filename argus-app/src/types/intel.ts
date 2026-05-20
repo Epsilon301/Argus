@@ -1,10 +1,24 @@
-export type LayerKey = "flights" | "military" | "satellites" | "seismic" | "cctv";
-export type FeedKey = "opensky" | "celestrak" | "usgs" | "adsb" | "tfl";
+export type LayerKey =
+  | "flights"
+  | "military"
+  | "satellites"
+  | "satelliteLinks"
+  | "seismic"
+  | "bases"
+  | "outages"
+  | "threats"
+  | "gdelt"
+  | "anomalies"
+  | "weather"
+  | "vessels";
+export type SceneMode = "globe_sat" | "globe_street" | "globe_map" | "flat_map";
+export type FeedKey = "opensky" | "celestrak" | "usgs" | "adsb" | "cfradar" | "otx" | "fred" | "ais" | "gdelt" | "threatradar" | "phantom";
 export type VisualMode = "normal" | "nvg" | "flir" | "crt";
-export type PlatformMode = "live" | "playback" | "analytics";
+export type PlatformMode = "live" | "playback" | "analytics" | "epic-fury";
 export type AnalyticsLayerKey = "gfs_weather" | "sentinel_imagery";
 export type CameraCategory = "Traffic" | "Nature" | "Landmark" | "Wildlife" | "Scenic" | "Infrastructure";
 export type CameraProvider = "TFL" | "Windy" | "Hardcoded";
+export type FlightCategory = "commercial" | "private" | "unknown";
 
 export type NvgVisualParams = {
   gain: number;
@@ -88,6 +102,15 @@ export interface TrackedFlight {
   verticalRate: number | null;
   onGround: boolean;
   squawk: string | null;
+  category: FlightCategory;
+}
+
+export interface PlaybackFlightSnapshot {
+  id: string;
+  callsign: string;
+  longitude: number;
+  latitude: number;
+  altitudeMeters: number;
 }
 
 export interface MilitaryFlight {
@@ -99,6 +122,14 @@ export interface MilitaryFlight {
   trueTrack: number;
   velocity: number;
   type: string | null;
+}
+
+export interface PlaybackMilitarySnapshot {
+  id: string;
+  callsign: string;
+  longitude: number;
+  latitude: number;
+  altitudeMeters: number;
 }
 
 export type OrbitType = "LEO" | "MEO" | "GEO" | "HEO" | "SSO" | "Unknown";
@@ -127,6 +158,14 @@ export interface SatelliteRecord {
 }
 
 export interface SatellitePosition {
+  id: string;
+  name: string;
+  longitude: number;
+  latitude: number;
+  altitudeKm: number;
+}
+
+export interface PlaybackSatelliteSnapshot {
   id: string;
   name: string;
   longitude: number;
@@ -171,21 +210,35 @@ export interface SelectedIntel {
   fullFacts: IntelDatum[];
   imageUrl?: string;
   streamUrl?: string;
+  externalUrl?: string;
+  externalLabel?: string;
+  analysisSummary?: string;
+  coordinates?: {
+    lat: number;
+    lon: number;
+    altMeters?: number | null;
+  };
+}
+
+export interface ClickedCoordinates {
+  lat: number;
+  lon: number;
+  altMeters?: number | null;
 }
 
 export type PlaybackSpeed = 1 | 3 | 5 | 15 | 60;
 
 export interface RecordedFlightFrame {
   timestamp: number;
-  data: TrackedFlight[];
+  data: PlaybackFlightSnapshot[];
 }
 
 export interface RecordedMilitaryFrame {
   timestamp: number;
-  data: MilitaryFlight[];
+  data: PlaybackMilitarySnapshot[];
 }
 
 export interface RecordedSatelliteFrame {
   timestamp: number;
-  data: SatellitePosition[];
+  data: PlaybackSatelliteSnapshot[];
 }

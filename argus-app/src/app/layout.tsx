@@ -1,17 +1,24 @@
-import type { Metadata } from "next";
-import { IBM_Plex_Mono } from "next/font/google";
+import type { Metadata, Viewport } from "next";
+import { JetBrains_Mono } from "next/font/google";
+import { Analytics } from "@vercel/analytics/react";
 
 import "./globals.css";
 
-const plexMono = IBM_Plex_Mono({
+const jetbrainsMono = JetBrains_Mono({
   weight: ["400", "500", "600"],
   subsets: ["latin"],
-  variable: "--font-plex-mono",
+  variable: "--font-jetbrains-mono",
 });
 
 export const metadata: Metadata = {
-  title: "ARGUS",
-  description: "Real-time geospatial intelligence dashboard",
+  title: "ARGUS | Epsilon LLC",
+  description: "Real-time geospatial intelligence dashboard — Epsilon LLC",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
 };
 
 export default function RootLayout({
@@ -21,7 +28,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${plexMono.variable} antialiased`}>{children}</body>
+      <body className={`${jetbrainsMono.variable} antialiased`}>
+        {children}
+        <Analytics />
+      </body>
     </html>
   );
 }

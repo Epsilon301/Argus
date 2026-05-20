@@ -1,9 +1,12 @@
+import path from "path";
 import type { NextConfig } from "next";
+import { withSentryConfig } from "@sentry/nextjs";
 
 const nextConfig: NextConfig = {
-  output: 'standalone',
+  output: "standalone",
+  outputFileTracingRoot: path.resolve(process.cwd()),
   // Turbopack disabled to prevent os error 60 file read timeouts with large Cesium assets
-  serverExternalPackages: ['cesium'],
+  serverExternalPackages: ["cesium"],
   webpack: (config) => {
     // Tell webpack NOT to parse the Cesium static assets (thousands of files causing ETIMEDOUT)
     config.watchOptions = {
@@ -15,9 +18,8 @@ const nextConfig: NextConfig = {
         "**/public/cesium/**",
       ],
     };
-    
     // Disable resolving of binary workers that crash Turbopack/Webpack
-    if(config.resolve && config.resolve.fallback) {
+    if (config.resolve && config.resolve.fallback) {
       config.resolve.fallback = { ...config.resolve.fallback, fs: false };
     }
 
@@ -25,4 +27,12 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+export default withSentryConfig(nextConfig, {
+  org: "argus",
+  project: "argus-app",
+  silent: true,
+  disableLogger: true,
+  sourcemaps: {
+    disable: true,
+  },
+});

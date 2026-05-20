@@ -3,14 +3,14 @@ import { create } from "zustand";
 import type { IntelBriefing } from "@/lib/intel/analysisEngine";
 import type {
   AnalyticsLayerKey,
-  CameraCategory,
   CameraReadout,
-  CctvCamera,
+  ClickedCoordinates,
   FeedHealth,
   FeedKey,
   LayerKey,
   PlaybackSpeed,
   PlatformMode,
+  SceneMode,
   VisualMode,
   VisualParams,
 } from "@/types/intel";
@@ -29,8 +29,15 @@ type ArgusStore = {
     flights: number;
     military: number;
     satellites: number;
+    satelliteLinks: number;
     seismic: number;
-    cctv: number;
+    bases: number;
+    outages: number;
+    threats: number;
+    gdelt: number;
+    anomalies: number;
+    weather: number;
+    vessels: number;
   };
   feedHealth: Record<FeedKey, FeedHealth>;
   activePoiId: string | null;
@@ -44,7 +51,19 @@ type ArgusStore = {
   toggleLayer: (layer: LayerKey) => void;
   setLayer: (layer: LayerKey, enabled: boolean) => void;
   setCount: (
-    key: "flights" | "military" | "satellites" | "seismic" | "cctv",
+    key:
+      | "flights"
+      | "military"
+      | "satellites"
+      | "satelliteLinks"
+      | "seismic"
+      | "bases"
+      | "outages"
+      | "threats"
+      | "gdelt"
+      | "anomalies"
+      | "weather"
+      | "vessels",
     value: number,
   ) => void;
   setFeedHealthy: (key: FeedKey) => void;
@@ -62,28 +81,33 @@ type ArgusStore = {
     key: P,
     value: number,
   ) => void;
-  cctvCategoryFilter: CameraCategory | "All";
-  setCctvCategoryFilter: (filter: CameraCategory | "All") => void;
   toggleAnalyticsLayer: (key: AnalyticsLayerKey) => void;
   setActiveGfsCogPath: (path: string | null) => void;
   intelBriefing: IntelBriefing | null;
   setIntelBriefing: (briefing: IntelBriefing | null) => void;
   trackedEntityId: string | null;
   setTrackedEntityId: (id: string | null) => void;
-  cameras: CctvCamera[];
-  setCameras: (cameras: CctvCamera[]) => void;
   searchQuery: string;
   setSearchQuery: (query: string) => void;
   searchResults: SearchResult[];
   setSearchResults: (results: SearchResult[]) => void;
+  sceneMode: SceneMode;
+  clickedCoordinates: ClickedCoordinates | null;
+  // DVR Playback
+  playbackTime: Date | null;
   playbackSpeed: PlaybackSpeed;
-  setPlaybackSpeed: (speed: PlaybackSpeed) => void;
   isPlaying: boolean;
+  setPlaybackTime: (time: Date | null) => void;
+  setPlaybackSpeed: (speed: PlaybackSpeed) => void;
   setIsPlaying: (playing: boolean) => void;
   playbackTimeRange: { start: number; end: number } | null;
   setPlaybackTimeRange: (range: { start: number; end: number } | null) => void;
   playbackCurrentTime: number;
   setPlaybackCurrentTime: (time: number) => void;
+  setSceneMode: (mode: SceneMode) => void;
+  setClickedCoordinates: (coords: ClickedCoordinates | null) => void;
+  dayNight: boolean;
+  toggleDayNight: () => void;
 };
 
 const emptyFeed = (): FeedHealth => ({
@@ -94,25 +118,45 @@ const emptyFeed = (): FeedHealth => ({
 
 export const useArgusStore = create<ArgusStore>((set) => ({
   layers: {
-    flights: true,
-    military: false,
-    satellites: true,
-    seismic: true,
-    cctv: true,
+    flights: false,
+    military: true,
+    satellites: false,
+    satelliteLinks: true,
+    seismic: false,
+    bases: true,
+    outages: true,
+    threats: true,
+    gdelt: true,
+    anomalies: true,
+    weather: false,
+    vessels: true,
   },
   counts: {
     flights: 0,
     military: 0,
     satellites: 0,
+    satelliteLinks: 0,
     seismic: 0,
-    cctv: 0,
+    bases: 0,
+    outages: 0,
+    threats: 0,
+    gdelt: 0,
+    anomalies: 0,
+    weather: 0,
+    vessels: 0,
   },
   feedHealth: {
     opensky: emptyFeed(),
     celestrak: emptyFeed(),
     usgs: emptyFeed(),
     adsb: emptyFeed(),
-    tfl: emptyFeed(),
+    cfradar: emptyFeed(),
+    otx: emptyFeed(),
+    fred: emptyFeed(),
+    ais: emptyFeed(),
+    gdelt: emptyFeed(),
+    threatradar: emptyFeed(),
+    phantom: emptyFeed(),
   },
   activePoiId: null,
   camera: {
@@ -128,8 +172,6 @@ export const useArgusStore = create<ArgusStore>((set) => ({
     sentinel_imagery: false,
   },
   activeGfsCogPath: null,
-  cctvCategoryFilter: "All",
-  setCctvCategoryFilter: (filter) => set({ cctvCategoryFilter: filter }),
   visualParams: {
     nvg: {
       gain: 0.75,
@@ -219,18 +261,25 @@ export const useArgusStore = create<ArgusStore>((set) => ({
   setIntelBriefing: (briefing) => set({ intelBriefing: briefing }),
   trackedEntityId: null,
   setTrackedEntityId: (id) => set({ trackedEntityId: id }),
-  cameras: [],
-  setCameras: (cameras) => set({ cameras }),
   searchQuery: "",
   setSearchQuery: (query) => set({ searchQuery: query }),
   searchResults: [],
   setSearchResults: (results) => set({ searchResults: results }),
+  sceneMode: "globe_sat",
+  clickedCoordinates: null,
+  setSceneMode: (mode) => set({ sceneMode: mode }),
+  setClickedCoordinates: (coords) => set({ clickedCoordinates: coords }),
+  // DVR Playback
+  playbackTime: null,
   playbackSpeed: 1,
-  setPlaybackSpeed: (speed) => set({ playbackSpeed: speed }),
   isPlaying: false,
+  setPlaybackTime: (time) => set({ playbackTime: time }),
+  setPlaybackSpeed: (speed) => set({ playbackSpeed: speed }),
   setIsPlaying: (playing) => set({ isPlaying: playing }),
   playbackTimeRange: null,
   setPlaybackTimeRange: (range) => set({ playbackTimeRange: range }),
   playbackCurrentTime: 0,
   setPlaybackCurrentTime: (time) => set({ playbackCurrentTime: time }),
+  dayNight: false,
+  toggleDayNight: () => set((state) => ({ dayNight: !state.dayNight })),
 }));
